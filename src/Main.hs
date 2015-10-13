@@ -3,8 +3,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main(main) where
 
-import Down.Geometry
+import Game.Waddle as Waddle
 
+import Data.ByteString(ByteString)
+import Data.CaseInsensitive(mk)
 import Data.Map(Map)
 import qualified Data.Map as Map
 import Control.Monad
@@ -14,60 +16,44 @@ import Foreign.C.Types
 import Linear
 import Linear.Affine
 import Data.Time.Clock
+import System.Environment
+import System.Exit
+import System.IO
 
 screenWidth, screenHeight :: CInt
-(screenWidth, screenHeight) = (640, 480)
+(screenWidth, screenHeight) = (640*2, 480*2)
 
 data State = State {
   stateX :: CInt,
   stateY :: CInt,
   stateLines :: Map (Id Line) Line,
-  stateSides :: Map (Id Side) Side
+  stateSides :: Map (Id Side) Side,
+  playerPos  :: V2 CInt,
+  playerAngle :: Double
   }
 
-initialState :: State
-initialState =
-  let s = sideMap lineMap
-  in
+initialState :: Map (Id Line) Line -> Map (Id Side) Side -> State
+initialState lineMap sideMap =
    State {
      stateX = 10,
      stateY = 10,
      stateLines = lineMap,
-     stateSides = s
+     stateSides = sideMap,
+     playerPos = V2 0 0,
+     playerAngle = pi
      }
 
+main :: IO ()
 main = do
   putStrLn "DOWN operating system starting..."
-  let a = V2 0 3
-      b = V2 4 5.2
-      d = 3.8
-  putStrLn $ "a = " ++ vShow a ++ ", b = " ++ vShow b ++ "; a + b = " ++ vShow (a + b)
-  putStrLn $ "a = " ++ vShow a ++ ", b = " ++ vShow b ++ "; a - b = " ++ vShow (a - b)
-  putStrLn $ "a = " ++ vShow a ++ ", d = " ++ show d ++ "; d * a = " ++ vShow (d *^a)
-
-  let p1 = V2 0 0
-      p2 = V2 1 1
-      ps = [V2 0 0, V2 1 1, V2 0 1, V2 1 0]
-  forM_ ps $ \ p ->
-    putStrLn $ vShow p ++ " to line " ++ vShow p1 ++ "--" ++ vShow p2 ++ ": " ++ show (sideOfLine p p1 p2)
-
-  putStrLn $ "a = " ++ vShow a ++ ", ^a = " ++ vShow (vNormalize a) ++ ", |^a| = " ++ show (vLength $ vNormalize a)
-  putStrLn $ "b = " ++ vShow a ++ ", ^b = " ++ vShow (vNormalize b) ++ ", |^b| = " ++ show (vLength $ vNormalize b)
-
-  let lines = [(V2 (-1) 1, V2 1 1),
-               (V2 1 1, V2 1 (-1)),
-               (V2 1 (-1), V2 (-1) (-1)),
-               (V2 (-1) (-1), V2 (-1) 1)]
-
-  forM_ lines $ \ (p1, p2) ->
-    let p = V2 0 0 in
-    putStrLn $ vShow p ++ " to line " ++ vShow p1 ++ "--" ++ vShow p2 ++ ": " ++ show (sideOfLine p p1 p2)
-
-  forM_ lines $ \ (p1, p2) ->
-    let l0 = V2 (-4) (-2)
-        l1 = V2 8 5 in
-    putStrLn $ "intersection between " ++ vShow l0 ++ "--" ++ vShow l1 ++ " and " ++ vShow p1 ++ "--" ++ vShow p2 ++ ": " ++
-      (show $ segmentIntersect l0 l1 p1 p2)
+  args <- getArgs
+  wadFile <- case args of
+    [wadFile] -> do
+      putStrLn $ "Loading WAD " ++ wadFile ++ "..."
+      Waddle.load wadFile
+    _ -> do
+      hPutStrLn stderr "usage: down WADFILE"
+      exitFailure
 
   SDL.initialize [SDL.InitVideo]
 
@@ -94,38 +80,85 @@ main = do
   let updateFun state =
         return $ state{
           stateX = stateX state + 1,
-          stateY = stateY state + 1
+          stateY = stateY state + 1,
+          playerAngle = playerAngle state + 0.02
           }
 
-  let state = initialState
-  gameLoop renderer updateFun renderScene state
+  let (lineMap, sideMap, minx, maxx, miny, maxy) = convertLevel wadFile "E1M1"
+
+  putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides, minx: " ++ show minx ++ ", maxx: " ++ show maxx ++ ", miny: " ++ show miny ++ ", maxy: " ++ show maxy
+  mapM_ print (Map.toList lineMap)
+  let state = initialState lineMap sideMap
+  gameLoop renderer (1/30) updateFun renderScene state
 
   SDL.destroyRenderer renderer
   SDL.destroyWindow window
   SDL.quit
 
+convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, CInt, CInt, CInt, CInt)
+convertLevel wad lumpName =
+  let Just (Level{..}) = Map.lookup (mk lumpName) (wadLevels wad)
+      (minx, maxx, miny, maxy) = foldr (\ Vertex{..} (minx', maxx', miny', maxy') ->
+                                         (min minx' (fromIntegral vertexX),
+                                          max maxx' (fromIntegral vertexX),
+                                          min miny' (fromIntegral vertexY),
+                                          max maxy' (fromIntegral vertexY)))
+                                 (60000 :: CInt, -60000 :: CInt, 60000 :: CInt, -60000 :: CInt)
+                                 levelVertices
+      lineList = zipWith (\ idx LineDef{..} ->
+                       (Id idx,
+                        mkLine
+                        (((toV2 minx maxx miny maxy $ levelVertices !! (fromIntegral lineDefStartVertex))))
+                        (((toV2 minx maxx miny maxy $ levelVertices !! (fromIntegral lineDefEndVertex))))
+                        (Id (fromIntegral lineDefRightSideDef))
+                        (fmap (Id . fromIntegral) lineDefLeftSideDef)))
+             [0..]
+             levelLineDefs
+      lmap = Map.fromList lineList
+      smap = concatMap (\ (idx, Line{..}) -> 
+               (lineRight, mkSide lmap idx True) :
+               (case lineLeft of
+                   Nothing -> []
+                   Just l -> [(l, mkSide lmap idx False)]))
+               lineList
+  in (lmap, Map.fromList smap, minx, maxx, miny, maxy)
+ where
+   toV2 minx maxx miny maxy (Vertex {..}) =
+     V2 ((fromIntegral vertexX + (minx `div` 2)) `div` 4) (((negate (fromIntegral vertexY - (miny `div` 2)))) `div` 4)
+
 renderScene :: SDL.Renderer -> State -> IO ()
-renderScene renderer state@State{..} = do
+renderScene renderer State{..} = do
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
 
   SDL.rendererDrawColor renderer $= V4 minBound minBound minBound maxBound
-  SDL.drawLine renderer (P (V2 0 0)) (P (V2 stateX stateY))
+
+  let offset = V2 (screenWidth `div` 2) (screenHeight `div` 2)
+
+  SDL.drawLine renderer (P (V2 (-1000) 0 + offset)) (P (V2 1000 0 + offset))
+  SDL.drawLine renderer (P (V2 0 (-1000) + offset)) (P (V2 0 1000 + offset))
 
   forM_ (Map.elems stateLines) $ \ Line{..} -> do
-    SDL.drawLine renderer (P (V2 (screenWidth`div`2) (screenHeight`div`2) + lineP1))
-      (P (V2 (screenWidth`div`2) (screenHeight`div`2) + lineP2))
+    SDL.drawLine renderer (P (lineP1 + offset)) (P (lineP2 + offset))
+
+  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + playerPos + offset)) (V2 10 10)))
+  let V2 dx dy = angle playerAngle
+      idx = round (dx * 30)
+      idy = round (dy * 30)
+  SDL.drawLine renderer (P (playerPos + offset)) (P (V2 idx idy + playerPos + offset))
+
   SDL.present renderer
 
-gameLoop :: SDL.Renderer -> (State -> IO State) -> (SDL.Renderer -> State -> IO ()) -> State -> IO ()
-gameLoop renderer updateFun renderFun state = do
+-- | This is a generic game loop.  It is based on the adaptive game
+-- loop in Robert Nystrom, "Game Programming Patterns", see
+-- http://gameprogrammingpatterns.com/game-loop.html for details.
+--
+gameLoop :: SDL.Renderer -> Double -> (state -> IO state) -> (SDL.Renderer -> state -> IO ()) -> state -> IO ()
+gameLoop renderer ms_per_update updateFun renderFun startState = do
   now <- getCurrentTime
-  loop now 0 0 now 0.0 0 state
+  loop now (0 :: Int) (0 :: Int) now (0.0 :: Double) (0 :: Int) startState
  where
-   ms_per_update :: Double
-   ms_per_update = 1/30
-
-   loop :: UTCTime -> Int -> Int -> UTCTime -> Double -> Int -> State -> IO ()
+--   loop :: UTCTime -> Int -> Int -> UTCTime -> Double -> Int -> State -> IO ()
    loop !lastReportTime !lastReportFrames !lastReportTicks !previousTime !lag !gameTicksIn stateIn = do
 
      now <- getCurrentTime
@@ -182,7 +215,7 @@ data Line = Line {
 
 mkLine :: V2 CInt -> V2 CInt -> Id Side -> Maybe (Id Side) -> Line
 mkLine p1 p2 right mbLeft =
-  let delta@(V2 dx dy) = p2 - p1
+  let delta = p2 - p1
   in
    Line {
      lineP1 = p1,
@@ -198,7 +231,7 @@ mkSide lineMap lineId onRight =
   let Just (Line{..}) = Map.lookup lineId lineMap
       p1 = if onRight then lineP1 else lineP2
       p2 = if onRight then lineP2 else lineP1
-      delta@(V2 dx dy) = p2 - p1
+      delta = p2 - p1
   in
    Side {
      sideP1 = p1,
@@ -208,16 +241,16 @@ mkSide lineMap lineId onRight =
      sideLine = lineId
      }
 
-lineMap :: Map (Id Line) Line
-lineMap = Map.fromList(
-  [(Id 0, mkLine (V2 (-100) 100) (V2 100 130) (Id 0) Nothing),
-   (Id 1, mkLine (V2 100 130) (V2 100 (-100)) (Id 1) Nothing),
-   (Id 2, mkLine (V2 100 (-100)) (V2 (-100) (-100)) (Id 2) Nothing),
-   (Id 3, mkLine (V2 (-100) (-100)) (V2 (-100) 100) (Id 3) Nothing)])
+-- lineMap :: Map (Id Line) Line
+-- lineMap = Map.fromList(
+--   [(Id 0, mkLine (V2 (-100) 100) (V2 100 130) (Id 0) Nothing),
+--    (Id 1, mkLine (V2 100 130) (V2 100 (-100)) (Id 1) Nothing),
+--    (Id 2, mkLine (V2 100 (-100)) (V2 (-100) (-100)) (Id 2) Nothing),
+--    (Id 3, mkLine (V2 (-100) (-100)) (V2 (-100) 100) (Id 3) Nothing)])
 
-sideMap :: Map (Id Line) Line -> Map (Id Side) Side
-sideMap lineMap = Map.fromList(
-  [(Id 0, mkSide lineMap (Id 0)  True),
-   (Id 1, mkSide lineMap (Id 1)  True),
-   (Id 2, mkSide lineMap (Id 2)  True),
-   (Id 3, mkSide lineMap (Id 3)  True)])
+-- sideMap :: Map (Id Line) Line -> Map (Id Side) Side
+-- sideMap lineMap = Map.fromList(
+--   [(Id 0, mkSide lineMap (Id 0)  True),
+--    (Id 1, mkSide lineMap (Id 1)  True),
+--    (Id 2, mkSide lineMap (Id 2)  True),
+--    (Id 3, mkSide lineMap (Id 3)  True)])
