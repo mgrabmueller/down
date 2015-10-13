@@ -21,9 +21,10 @@ import System.Exit
 import System.IO
 
 screenWidth, screenHeight :: CInt
-(screenWidth, screenHeight) = (640*2, 480*2)
+(screenWidth, screenHeight) = (1200, 800)
 
 data State = State {
+  stateRenderer :: SDL.Renderer,
   stateX :: CInt,
   stateY :: CInt,
   stateLines :: Map (Id Line) Line,
@@ -32,9 +33,10 @@ data State = State {
   playerAngle :: Double
   }
 
-initialState :: Map (Id Line) Line -> Map (Id Side) Side -> State
-initialState lineMap sideMap =
+initialState :: SDL.Renderer -> Map (Id Line) Line -> Map (Id Side) Side -> State
+initialState renderer lineMap sideMap =
    State {
+     stateRenderer = renderer,
      stateX = 10,
      stateY = 10,
      stateLines = lineMap,
@@ -88,8 +90,8 @@ main = do
 
   putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides, minx: " ++ show minx ++ ", maxx: " ++ show maxx ++ ", miny: " ++ show miny ++ ", maxy: " ++ show maxy
   mapM_ print (Map.toList lineMap)
-  let state = initialState lineMap sideMap
-  gameLoop renderer (1/30) updateFun renderScene state
+  let state = initialState renderer lineMap sideMap
+  gameLoop (1/30) processInput updateFun renderScene state
 
   SDL.destroyRenderer renderer
   SDL.destroyWindow window
@@ -124,10 +126,12 @@ convertLevel wad lumpName =
   in (lmap, Map.fromList smap, minx, maxx, miny, maxy)
  where
    toV2 minx maxx miny maxy (Vertex {..}) =
-     V2 ((fromIntegral vertexX + (minx `div` 2)) `div` 4) (((negate (fromIntegral vertexY - (miny `div` 2)))) `div` 4)
+     V2 ((fromIntegral vertexX + (minx `div` 2)) `div` 5) (((negate (fromIntegral vertexY - (miny `div` 2)))) `div` 5)
 
-renderScene :: SDL.Renderer -> State -> IO ()
-renderScene renderer State{..} = do
+renderScene :: State -> IO ()
+renderScene State{..} = do
+  let renderer = stateRenderer
+
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
 
@@ -149,17 +153,21 @@ renderScene renderer State{..} = do
 
   SDL.present renderer
 
+processInput :: [SDL.Event] -> State -> IO (State, Bool)
+processInput events state = do
+  let quit = any (== SDL.QuitEvent) $ map SDL.eventPayload events
+  return (state, quit)
+
 -- | This is a generic game loop.  It is based on the adaptive game
 -- loop in Robert Nystrom, "Game Programming Patterns", see
 -- http://gameprogrammingpatterns.com/game-loop.html for details.
 --
-gameLoop :: SDL.Renderer -> Double -> (state -> IO state) -> (SDL.Renderer -> state -> IO ()) -> state -> IO ()
-gameLoop renderer ms_per_update updateFun renderFun startState = do
+gameLoop :: Double -> ([SDL.Event] -> state -> IO (state, Bool)) -> (state -> IO state) -> (state -> IO ()) -> state -> IO ()
+gameLoop ms_per_update inputFun updateFun renderFun startState = do
   now <- getCurrentTime
   loop now (0 :: Int) (0 :: Int) now (0.0 :: Double) (0 :: Int) startState
  where
---   loop :: UTCTime -> Int -> Int -> UTCTime -> Double -> Int -> State -> IO ()
-   loop !lastReportTime !lastReportFrames !lastReportTicks !previousTime !lag !gameTicksIn stateIn = do
+   loop !lastReportTime !lastReportFrames !lastReportTicks !previousTime !lag !gameTicksIn stateIn1 = do
 
      now <- getCurrentTime
      let elapsed = now `diffUTCTime` previousTime
@@ -167,8 +175,7 @@ gameLoop renderer ms_per_update updateFun renderFun startState = do
          lag' = lag + fromRational (toRational elapsed)
 
      events <- SDL.pollEvents
-     let quit = any (== SDL.QuitEvent) $ map SDL.eventPayload events
-
+     (stateIn, quit) <- inputFun events stateIn1
 
      let updateLoop theLag gameTicks state
            | theLag >= ms_per_update = do
@@ -178,7 +185,7 @@ gameLoop renderer ms_per_update updateFun renderFun startState = do
 
      (lagOut, gameTicksOut, stateOut) <- updateLoop lag' gameTicksIn stateIn
 
-     renderFun renderer stateOut
+     renderFun stateOut
 
      let diff = now `diffUTCTime` lastReportTime
      unless quit $ do
