@@ -5,6 +5,8 @@ module Main(main) where
 
 import Game.Waddle as Waddle
 
+import qualified Data.Text as Text
+import Text.Printf
 import Data.ByteString(ByteString)
 import Data.CaseInsensitive(mk)
 import Data.Map(Map)
@@ -23,6 +25,25 @@ import System.IO
 screenWidth, screenHeight :: CInt
 (screenWidth, screenHeight) = (1200, 800)
 
+data Input = Input {
+  inputMoveForward :: Bool,
+  inputMoveBackward :: Bool,
+  inputStrafeLeft :: Bool,
+  inputStrafeRight :: Bool,
+  inputTurnLeft :: Bool,
+  inputTurnRight :: Bool
+  }
+
+initialInput :: Input
+initialInput = Input {
+  inputMoveForward = False,
+  inputMoveBackward = False,
+  inputStrafeLeft = False,
+  inputStrafeRight = False,
+  inputTurnLeft = False,
+  inputTurnRight = False
+  }
+
 data State = State {
   stateRenderer :: SDL.Renderer,
   stateX :: CInt,
@@ -30,19 +51,23 @@ data State = State {
   stateLines :: Map (Id Line) Line,
   stateSides :: Map (Id Side) Side,
   playerPos  :: V2 CInt,
-  playerAngle :: Double
+  playerAngle :: Double,
+  stateScaleFactor :: CInt,
+  stateInput :: Input
   }
 
-initialState :: SDL.Renderer -> Map (Id Line) Line -> Map (Id Side) Side -> State
-initialState renderer lineMap sideMap =
+initialState :: SDL.Renderer -> Map (Id Line) Line -> Map (Id Side) Side -> V2 CInt -> State
+initialState renderer lineMap sideMap playerPos =
    State {
      stateRenderer = renderer,
      stateX = 10,
      stateY = 10,
      stateLines = lineMap,
      stateSides = sideMap,
-     playerPos = V2 0 0,
-     playerAngle = pi
+     playerPos = playerPos,
+     playerAngle = pi,
+     stateScaleFactor = 5,
+     stateInput = initialInput
      }
 
 main :: IO ()
@@ -58,6 +83,7 @@ main = do
       exitFailure
 
   SDL.initialize [SDL.InitVideo]
+
 
   SDL.HintRenderScaleQuality $= SDL.ScaleLinear
   do renderQuality <- SDL.get SDL.HintRenderScaleQuality
@@ -79,39 +105,58 @@ main = do
          , SDL.rendererTargetTexture = False
          })
 
+  rInfo <- SDL.getRendererInfo renderer
+  printf "Renderer: %s (%s)\n" (Text.unpack (SDL.rendererInfoName rInfo))
+    (show $ SDL.rendererType (SDL.rendererInfoFlags rInfo))
+
   let updateFun state =
         return $ state{
           stateX = stateX state + 1,
           stateY = stateY state + 1,
-          playerAngle = playerAngle state + 0.02
+          playerAngle = if inputTurnLeft (stateInput state)
+                        then playerAngle state - 0.1
+                        else
+                          if inputTurnRight (stateInput state)
+                          then playerAngle state + 0.1
+                          else
+                            playerAngle state,
+          playerPos = playerPos state +
+                      sum [if inputMoveForward (stateInput state)
+                           then V2 (round $ cos (playerAngle state) * 10) (round $ sin (playerAngle state) * 10)
+                           else zero,
+                           if inputMoveBackward (stateInput state)
+                           then V2 (round $ cos (playerAngle state + pi) * 10) (round $ sin (playerAngle state + pi) * 10)
+                           else zero,
+                           if inputStrafeLeft (stateInput state)
+                           then V2 (round $ cos (playerAngle state + pi/2) * 10) (round $ sin (playerAngle state + pi/2) * 10)
+                           else zero,
+                           if inputStrafeRight (stateInput state)
+                           then V2 (round $ cos (playerAngle state - pi/2) * 10) (round $ sin (playerAngle state - pi/2) * 10)
+                           else zero
+                           ]
           }
 
-  let (lineMap, sideMap, minx, maxx, miny, maxy) = convertLevel wadFile "E1M1"
+  let (lineMap, sideMap, playerPos) = convertLevel wadFile "E1M1"
 
-  putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides, minx: " ++ show minx ++ ", maxx: " ++ show maxx ++ ", miny: " ++ show miny ++ ", maxy: " ++ show maxy
-  mapM_ print (Map.toList lineMap)
-  let state = initialState renderer lineMap sideMap
+  putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides"
+  print playerPos
+  let state = initialState renderer lineMap sideMap (maybe (V2 0 0) id playerPos)
   gameLoop (1/30) processInput updateFun renderScene state
 
+  putStrLn "DOWN operating system shutting down..."
   SDL.destroyRenderer renderer
   SDL.destroyWindow window
   SDL.quit
+  putStrLn "ENDOWN."
 
-convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, CInt, CInt, CInt, CInt)
+convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, Maybe (V2 CInt))
 convertLevel wad lumpName =
   let Just (Level{..}) = Map.lookup (mk lumpName) (wadLevels wad)
-      (minx, maxx, miny, maxy) = foldr (\ Vertex{..} (minx', maxx', miny', maxy') ->
-                                         (min minx' (fromIntegral vertexX),
-                                          max maxx' (fromIntegral vertexX),
-                                          min miny' (fromIntegral vertexY),
-                                          max maxy' (fromIntegral vertexY)))
-                                 (60000 :: CInt, -60000 :: CInt, 60000 :: CInt, -60000 :: CInt)
-                                 levelVertices
       lineList = zipWith (\ idx LineDef{..} ->
                        (Id idx,
                         mkLine
-                        (((toV2 minx maxx miny maxy $ levelVertices !! (fromIntegral lineDefStartVertex))))
-                        (((toV2 minx maxx miny maxy $ levelVertices !! (fromIntegral lineDefEndVertex))))
+                        (((toV2 $ levelVertices !! (fromIntegral lineDefStartVertex))))
+                        (((toV2 $ levelVertices !! (fromIntegral lineDefEndVertex))))
                         (Id (fromIntegral lineDefRightSideDef))
                         (fmap (Id . fromIntegral) lineDefLeftSideDef)))
              [0..]
@@ -123,10 +168,17 @@ convertLevel wad lumpName =
                    Nothing -> []
                    Just l -> [(l, mkSide lmap idx False)]))
                lineList
-  in (lmap, Map.fromList smap, minx, maxx, miny, maxy)
+      playerPos = foldr (\ Thing{..} acc ->
+                          case thingType of
+                            Player1StartPos ->  Just (V2 (fromIntegral thingX) (negate (fromIntegral thingY)))
+                            _ -> acc) Nothing levelThings
+  in (lmap, Map.fromList smap, playerPos)
  where
-   toV2 minx maxx miny maxy (Vertex {..}) =
-     V2 ((fromIntegral vertexX + (minx `div` 2)) `div` 5) (((negate (fromIntegral vertexY - (miny `div` 2)))) `div` 5)
+   toV2  (Vertex {..}) =
+     V2 (fromIntegral vertexX) (negate (fromIntegral vertexY))
+
+vDiv :: V2 CInt -> CInt -> V2 CInt
+vDiv (V2 x y) c = V2 (x `div` c) (y `div` c)
 
 renderScene :: State -> IO ()
 renderScene State{..} = do
@@ -135,28 +187,85 @@ renderScene State{..} = do
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
 
+  let offset = negate (playerPos `vDiv` stateScaleFactor) + V2 (screenWidth `div` 2) (screenHeight `div` 2)
+
+  -- Draw grid.
+  SDL.rendererDrawColor renderer $= V4 128 128 128 10
+
+  forM_ [-10..10] $ \ col ->
+    SDL.drawLine renderer (P (V2 (col * 128) (-2000) + offset)) (P (V2 (col * 128) 2000 + offset))
+
+  forM_ [-10..10] $ \ row ->
+    SDL.drawLine renderer (P (V2 (-2000) (row * 128) + offset)) (P (V2 2000 (row * 128) + offset))
+
+  -- Render map.
   SDL.rendererDrawColor renderer $= V4 minBound minBound minBound maxBound
 
-  let offset = V2 (screenWidth `div` 2) (screenHeight `div` 2)
-
-  SDL.drawLine renderer (P (V2 (-1000) 0 + offset)) (P (V2 1000 0 + offset))
-  SDL.drawLine renderer (P (V2 0 (-1000) + offset)) (P (V2 0 1000 + offset))
-
   forM_ (Map.elems stateLines) $ \ Line{..} -> do
-    SDL.drawLine renderer (P (lineP1 + offset)) (P (lineP2 + offset))
+    SDL.drawLine renderer (P (lineP1 `vDiv` stateScaleFactor + offset)) (P (lineP2 `vDiv` stateScaleFactor + offset))
 
-  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + playerPos + offset)) (V2 10 10)))
+  -- Render player.
+  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + offset + playerPos `vDiv` stateScaleFactor)) (V2 10 10)))
   let V2 dx dy = angle playerAngle
       idx = round (dx * 30)
       idy = round (dy * 30)
-  SDL.drawLine renderer (P (playerPos + offset)) (P (V2 idx idy + playerPos + offset))
+  SDL.drawLine renderer (P (offset + playerPos `vDiv` stateScaleFactor))
+    (P (V2 idx idy + offset + playerPos `vDiv` stateScaleFactor))
 
   SDL.present renderer
 
 processInput :: [SDL.Event] -> State -> IO (State, Bool)
 processInput events state = do
-  let quit = any (== SDL.QuitEvent) $ map SDL.eventPayload events
-  return (state, quit)
+  return $ foldl processEvent (state, False) events
+ where
+   processEvent (stateIn, quit) (SDL.Event _ SDL.QuitEvent) =
+     (state, True)
+   processEvent (stateIn, quit) (SDL.Event _ (SDL.KeyboardEvent ke)) =
+     case SDL.keyboardEventKeyMotion ke of
+       SDL.Pressed ->
+         case SDL.keysymKeycode (SDL.keyboardEventKeysym ke) of
+           SDL.KeycodeA ->
+             (stateIn{stateInput = (stateInput stateIn){inputStrafeLeft = True}}, quit)
+           SDL.KeycodeD ->
+             (stateIn{stateInput = (stateInput stateIn){inputStrafeRight = True}}, quit)
+           SDL.KeycodeW ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveForward = True}}, quit)
+           SDL.KeycodeUp ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveForward = True}}, quit)
+           SDL.KeycodeS ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveBackward = True}}, quit)
+           SDL.KeycodeDown ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveBackward = True}}, quit)
+           SDL.KeycodeLeft ->
+             (stateIn{stateInput = (stateInput stateIn){inputTurnLeft = True}}, quit)
+           SDL.KeycodeRight ->
+             (stateIn{stateInput = (stateInput stateIn){inputTurnRight = True}}, quit)
+           _ ->
+             (stateIn, quit)
+       SDL.Released ->
+         case SDL.keysymKeycode (SDL.keyboardEventKeysym ke) of
+           SDL.KeycodeEscape ->
+             (stateIn, True)
+           SDL.KeycodeA ->
+             (stateIn{stateInput = (stateInput stateIn){inputStrafeLeft = False}}, quit)
+           SDL.KeycodeD ->
+             (stateIn{stateInput = (stateInput stateIn){inputStrafeRight = False}}, quit)
+           SDL.KeycodeW ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveForward = False}}, quit)
+           SDL.KeycodeUp ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveForward = False}}, quit)
+           SDL.KeycodeS ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveBackward = False}}, quit)
+           SDL.KeycodeDown ->
+             (stateIn{stateInput = (stateInput stateIn){inputMoveBackward = False}}, quit)
+           SDL.KeycodeLeft ->
+             (stateIn{stateInput = (stateInput stateIn){inputTurnLeft = False}}, quit)
+           SDL.KeycodeRight ->
+             (stateIn{stateInput = (stateInput stateIn){inputTurnRight = False}}, quit)
+           _ ->
+             (stateIn, quit)
+   processEvent (stateIn, quit) _ =
+     (stateIn, quit)
 
 -- | This is a generic game loop.  It is based on the adaptive game
 -- loop in Robert Nystrom, "Game Programming Patterns", see
@@ -247,17 +356,3 @@ mkSide lineMap lineId onRight =
 --     sideNormal = vNormalize (perp delta),
      sideLine = lineId
      }
-
--- lineMap :: Map (Id Line) Line
--- lineMap = Map.fromList(
---   [(Id 0, mkLine (V2 (-100) 100) (V2 100 130) (Id 0) Nothing),
---    (Id 1, mkLine (V2 100 130) (V2 100 (-100)) (Id 1) Nothing),
---    (Id 2, mkLine (V2 100 (-100)) (V2 (-100) (-100)) (Id 2) Nothing),
---    (Id 3, mkLine (V2 (-100) (-100)) (V2 (-100) 100) (Id 3) Nothing)])
-
--- sideMap :: Map (Id Line) Line -> Map (Id Side) Side
--- sideMap lineMap = Map.fromList(
---   [(Id 0, mkSide lineMap (Id 0)  True),
---    (Id 1, mkSide lineMap (Id 1)  True),
---    (Id 2, mkSide lineMap (Id 2)  True),
---    (Id 3, mkSide lineMap (Id 3)  True)])
