@@ -46,26 +46,40 @@ initialInput = Input {
 
 data State = State {
   stateRenderer :: SDL.Renderer,
+  stateAutomap :: Bool,
   stateX :: CInt,
   stateY :: CInt,
   stateLines :: Map (Id Line) Line,
   stateSides :: Map (Id Side) Side,
-  playerPos  :: V2 CInt,
+  playerPos  :: V2 Double,
   playerAngle :: Double,
+  playerAccel :: V2 Double,
+  playerVelocity :: V2 Double,
+  playerMaxSpeed :: Double,
+  playerMaxAccel :: Double,
+  playerTurnAngle :: Double,
+  playerMoveAccel :: Double,
   stateScaleFactor :: CInt,
   stateInput :: Input
   }
 
 initialState :: SDL.Renderer -> Map (Id Line) Line -> Map (Id Side) Side -> V2 CInt -> State
-initialState renderer lineMap sideMap playerPos =
+initialState renderer lineMap sideMap (V2 playerPosX playerPosY) =
    State {
      stateRenderer = renderer,
+     stateAutomap = False,
      stateX = 10,
      stateY = 10,
      stateLines = lineMap,
      stateSides = sideMap,
-     playerPos = playerPos,
+     playerPos = V2 (fromIntegral playerPosX) (fromIntegral playerPosY),
      playerAngle = pi,
+     playerAccel = V2 0 0,
+     playerVelocity = V2 0 0,
+     playerMaxSpeed = 20,
+     playerMaxAccel = 2,
+     playerTurnAngle = 0.05,
+     playerMoveAccel = 1,
      stateScaleFactor = 5,
      stateInput = initialInput
      }
@@ -109,39 +123,12 @@ main = do
   printf "Renderer: %s (%s)\n" (Text.unpack (SDL.rendererInfoName rInfo))
     (show $ SDL.rendererType (SDL.rendererInfoFlags rInfo))
 
-  let updateFun state =
-        return $ state{
-          stateX = stateX state + 1,
-          stateY = stateY state + 1,
-          playerAngle = if inputTurnLeft (stateInput state)
-                        then playerAngle state - 0.1
-                        else
-                          if inputTurnRight (stateInput state)
-                          then playerAngle state + 0.1
-                          else
-                            playerAngle state,
-          playerPos = playerPos state +
-                      sum [if inputMoveForward (stateInput state)
-                           then V2 (round $ cos (playerAngle state) * 10) (round $ sin (playerAngle state) * 10)
-                           else zero,
-                           if inputMoveBackward (stateInput state)
-                           then V2 (round $ cos (playerAngle state + pi) * 10) (round $ sin (playerAngle state + pi) * 10)
-                           else zero,
-                           if inputStrafeLeft (stateInput state)
-                           then V2 (round $ cos (playerAngle state + pi/2) * 10) (round $ sin (playerAngle state + pi/2) * 10)
-                           else zero,
-                           if inputStrafeRight (stateInput state)
-                           then V2 (round $ cos (playerAngle state - pi/2) * 10) (round $ sin (playerAngle state - pi/2) * 10)
-                           else zero
-                           ]
-          }
-
   let (lineMap, sideMap, playerPos) = convertLevel wadFile "E1M1"
 
   putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides"
   print playerPos
   let state = initialState renderer lineMap sideMap (maybe (V2 0 0) id playerPos)
-  gameLoop (1/30) processInput updateFun renderScene state
+  gameLoop (1/60) processInput updateState renderScene state
 
   putStrLn "DOWN operating system shutting down..."
   SDL.destroyRenderer renderer
@@ -180,14 +167,86 @@ convertLevel wad lumpName =
 vDiv :: V2 CInt -> CInt -> V2 CInt
 vDiv (V2 x y) c = V2 (x `div` c) (y `div` c)
 
+updateState ::  Monad m => State -> m State
+updateState state@State{..} = do
+  let accel = playerMoveAccel
+      moving = inputMoveForward (stateInput) ||
+               inputMoveBackward (stateInput) ||
+               inputStrafeLeft (stateInput) ||
+               inputStrafeRight (stateInput)
+  return $ state{
+    stateX = stateX + 1,
+    stateY = stateY + 1,
+    playerAngle = if inputTurnLeft (stateInput)
+                  then playerAngle - playerTurnAngle
+                  else
+                    if inputTurnRight (stateInput)
+                    then playerAngle + playerTurnAngle
+                    else
+                      playerAngle,
+    playerPos = playerPos + playerVelocity,
+    playerVelocity = if moving
+                     then
+                       let newVelocity = playerVelocity + playerAccel
+                           newSpeed = sqrt (quadrance newVelocity)
+                       in
+                        if newSpeed <= playerMaxSpeed
+                        then newVelocity
+                        else newVelocity ^* (playerMaxSpeed / newSpeed)
+                     else if quadrance playerVelocity < 0.5
+                          then zero
+                          else playerVelocity ^* 0.8,
+    playerAccel = if moving
+                  then
+                    let newAccel = playerAccel +
+                                   sum [if inputMoveForward (stateInput)
+                                        then V2 (cos (playerAngle) * accel) (sin (playerAngle) * accel)
+                                        else zero,
+                                        if inputMoveBackward (stateInput)
+                                        then V2 (cos (playerAngle + pi) * accel) (sin (playerAngle + pi) * accel)
+                                        else zero,
+                                        if inputStrafeLeft (stateInput)
+                                        then V2 (cos (playerAngle - pi/2) * accel) (sin (playerAngle - pi/2) * accel)
+                                        else zero,
+                                        if inputStrafeRight (stateInput)
+                                        then V2 (cos (playerAngle + pi/2) * accel) (sin (playerAngle + pi/2) * accel)
+                                        else zero
+                                       ]
+                        newAcc = sqrt (quadrance newAccel)
+                    in
+                     if newAcc <= playerMaxAccel
+                     then newAccel
+                     else newAccel ^* (playerMaxAccel / newAcc)
+                  else
+                    zero
+    }
+
 renderScene :: State -> IO ()
-renderScene State{..} = do
+renderScene state@State{..} = do
+  if stateAutomap
+    then renderAutomap state
+    else renderFirstPerson state
+  let renderer = stateRenderer
+  SDL.present renderer
+
+renderFirstPerson :: State -> IO ()
+renderFirstPerson State{..} = do
   let renderer = stateRenderer
 
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
 
-  let offset = negate (playerPos `vDiv` stateScaleFactor) + V2 (screenWidth `div` 2) (screenHeight `div` 2)
+  return ()
+
+renderAutomap :: State -> IO ()
+renderAutomap State{..} = do
+  let renderer = stateRenderer
+
+  SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
+  SDL.clear renderer
+
+  let intPlayerPos = fmap round playerPos
+  let offset = negate (intPlayerPos `vDiv` stateScaleFactor) + V2 (screenWidth `div` 2) (screenHeight `div` 2)
 
   -- Draw grid.
   SDL.rendererDrawColor renderer $= V4 128 128 128 10
@@ -205,21 +264,20 @@ renderScene State{..} = do
     SDL.drawLine renderer (P (lineP1 `vDiv` stateScaleFactor + offset)) (P (lineP2 `vDiv` stateScaleFactor + offset))
 
   -- Render player.
-  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + offset + playerPos `vDiv` stateScaleFactor)) (V2 10 10)))
+  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + offset + intPlayerPos `vDiv` stateScaleFactor)) (V2 10 10)))
   let V2 dx dy = angle playerAngle
       idx = round (dx * 30)
       idy = round (dy * 30)
-  SDL.drawLine renderer (P (offset + playerPos `vDiv` stateScaleFactor))
-    (P (V2 idx idy + offset + playerPos `vDiv` stateScaleFactor))
+  SDL.drawLine renderer (P (offset + intPlayerPos `vDiv` stateScaleFactor))
+    (P (V2 idx idy + offset + intPlayerPos `vDiv` stateScaleFactor))
 
-  SDL.present renderer
 
 processInput :: [SDL.Event] -> State -> IO (State, Bool)
 processInput events state = do
   return $ foldl processEvent (state, False) events
  where
-   processEvent (stateIn, quit) (SDL.Event _ SDL.QuitEvent) =
-     (state, True)
+   processEvent (stateIn, _) (SDL.Event _ SDL.QuitEvent) =
+     (stateIn, True)
    processEvent (stateIn, quit) (SDL.Event _ (SDL.KeyboardEvent ke)) =
      case SDL.keyboardEventKeyMotion ke of
        SDL.Pressed ->
@@ -246,6 +304,8 @@ processInput events state = do
          case SDL.keysymKeycode (SDL.keyboardEventKeysym ke) of
            SDL.KeycodeEscape ->
              (stateIn, True)
+           SDL.KeycodeTab ->
+             (stateIn{stateAutomap = not (stateAutomap stateIn)}, quit)
            SDL.KeycodeA ->
              (stateIn{stateInput = (stateInput stateIn){inputStrafeLeft = False}}, quit)
            SDL.KeycodeD ->
