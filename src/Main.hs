@@ -199,16 +199,16 @@ updateState state@State{..} = do
     playerAccel = if moving
                   then
                     let newAccel = playerAccel +
-                                   sum [if inputMoveForward (stateInput)
-                                        then V2 (cos (playerAngle) * accel) (sin (playerAngle) * accel)
+                                   sum [if inputMoveForward stateInput
+                                        then V2 (cos playerAngle * accel) (sin playerAngle * accel)
                                         else zero,
-                                        if inputMoveBackward (stateInput)
+                                        if inputMoveBackward stateInput
                                         then V2 (cos (playerAngle + pi) * accel) (sin (playerAngle + pi) * accel)
                                         else zero,
-                                        if inputStrafeLeft (stateInput)
+                                        if inputStrafeLeft stateInput
                                         then V2 (cos (playerAngle - pi/2) * accel) (sin (playerAngle - pi/2) * accel)
                                         else zero,
-                                        if inputStrafeRight (stateInput)
+                                        if inputStrafeRight stateInput
                                         then V2 (cos (playerAngle + pi/2) * accel) (sin (playerAngle + pi/2) * accel)
                                         else zero
                                        ]
@@ -235,6 +235,12 @@ renderFirstPerson State{..} = do
 
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
+
+  let angleInc = 60*pi/180
+  forM_ [0.. screenWidth - 1] $ \ col -> do
+    let angle = (fromIntegral $ col - screenWidth `div` 2) * angleInc
+    print (col, angle)
+  exitWith exitSuccess
 
   return ()
 
