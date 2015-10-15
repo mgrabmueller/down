@@ -5,6 +5,10 @@ module Main(main) where
 
 import Game.Waddle as Waddle
 
+import Down.Geometry
+
+import Data.List
+import Data.Maybe
 import qualified Data.Text as Text
 import Text.Printf
 import Data.ByteString(ByteString)
@@ -23,7 +27,7 @@ import System.Exit
 import System.IO
 
 screenWidth, screenHeight :: CInt
-(screenWidth, screenHeight) = (1200, 800)
+(screenWidth, screenHeight) = (600, 400)
 
 data Input = Input {
   inputMoveForward :: Bool,
@@ -59,7 +63,9 @@ data State = State {
   playerMaxAccel :: Double,
   playerTurnAngle :: Double,
   playerMoveAccel :: Double,
-  stateScaleFactor :: CInt,
+  playerFov :: Double,
+  playerViewRange :: Double,
+  stateScaleFactor :: Double,
   stateInput :: Input
   }
 
@@ -80,7 +86,9 @@ initialState renderer lineMap sideMap (V2 playerPosX playerPosY) =
      playerMaxAccel = 2,
      playerTurnAngle = 0.05,
      playerMoveAccel = 1,
-     stateScaleFactor = 5,
+     playerFov = 60 / 180 * pi,
+     playerViewRange = 2000,
+     stateScaleFactor = 7,
      stateInput = initialInput
      }
 
@@ -236,12 +244,47 @@ renderFirstPerson State{..} = do
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
 
-  let angleInc = 60*pi/180
-  forM_ [0.. screenWidth - 1] $ \ col -> do
-    let angle = (fromIntegral $ col - screenWidth `div` 2) * angleInc
-    print (col, angle)
-  exitWith exitSuccess
+  let angleInc = playerFov / fromIntegral screenWidth
+      horizon = screenHeight `div` 2
+      threeDscale = 8
+  SDL.rendererDrawColor renderer $= V4 minBound minBound minBound maxBound
 
+  forM_ [0.. (screenWidth `div` threeDscale) - 1] $ \ col -> do
+    let ang = playerAngle + (fromIntegral $ (col * threeDscale) - screenWidth `div` 2) * angleInc
+    let V2 dx dy = angle ang
+        idx = dx * playerViewRange
+        idy = dy * playerViewRange
+
+        rayP1 = playerPos
+        rayP2 = playerPos + V2 dx dy ^* playerViewRange
+
+    let iss = catMaybes $ map (\ Line{..} ->
+                               case lineLeft of
+                                 Nothing ->
+                                   let p3 = fmap fromIntegral lineP1
+                                       p4 = fmap fromIntegral lineP2
+                                       mbIs = segmentIntersect rayP1 rayP2 p3 p4
+                                   in
+                                    case mbIs of
+                                      Nothing -> Nothing
+                                      Just (is@(Intersection p)) ->
+                                        Just (distance playerPos p * cos (ang - playerAngle), is)
+                                 Just _ ->
+                                   Nothing
+                              )
+           (Map.elems stateLines)
+        iss' = sortBy (\ (pdist, _) (qdist, _) ->
+                        pdist `compare` qdist) iss
+    case iss' of
+      [] -> return ()
+      ((dist, Intersection p) : _) -> do
+        let disp = round (15 * playerViewRange / dist)
+            shade = round ((dist / playerViewRange) * 255)
+        SDL.rendererDrawColor renderer $= V4 shade shade shade maxBound
+        SDL.fillRect renderer $
+          Just (SDL.Rectangle (P (V2 (col * threeDscale) (horizon - disp)))
+                (V2 threeDscale (disp * 2)))
+    return()
   return ()
 
 renderAutomap :: State -> IO ()
@@ -251,8 +294,7 @@ renderAutomap State{..} = do
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
   SDL.clear renderer
 
-  let intPlayerPos = fmap round playerPos
-  let offset = negate (intPlayerPos `vDiv` stateScaleFactor) + V2 (screenWidth `div` 2) (screenHeight `div` 2)
+  let offset = fmap round (negate (playerPos ^/ stateScaleFactor)) + V2 (screenWidth `div` 2) (screenHeight `div` 2)
 
   -- Draw grid.
   SDL.rendererDrawColor renderer $= V4 128 128 128 10
@@ -267,15 +309,21 @@ renderAutomap State{..} = do
   SDL.rendererDrawColor renderer $= V4 minBound minBound minBound maxBound
 
   forM_ (Map.elems stateLines) $ \ Line{..} -> do
-    SDL.drawLine renderer (P (lineP1 `vDiv` stateScaleFactor + offset)) (P (lineP2 `vDiv` stateScaleFactor + offset))
+    SDL.drawLine renderer (P (fmap round (fmap fromIntegral lineP1 ^/ stateScaleFactor) + offset))
+      (P (fmap round (fmap fromIntegral lineP2 ^/ stateScaleFactor) + offset))
 
   -- Render player.
-  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + offset + intPlayerPos `vDiv` stateScaleFactor)) (V2 10 10)))
-  let V2 dx dy = angle playerAngle
-      idx = round (dx * 30)
-      idy = round (dy * 30)
-  SDL.drawLine renderer (P (offset + intPlayerPos `vDiv` stateScaleFactor))
-    (P (V2 idx idy + offset + intPlayerPos `vDiv` stateScaleFactor))
+  SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + offset + (fmap round (playerPos ^/ stateScaleFactor)))) (V2 10 10)))
+  let V2 dx1 dy1 = angle (playerAngle - playerFov / 2)
+      idx1 = (dx1 * playerViewRange)
+      idy1 = (dy1 * playerViewRange)
+  let V2 dx2 dy2 = angle (playerAngle + playerFov / 2)
+      idx2 = (dx2 * playerViewRange)
+      idy2 = (dy2 * playerViewRange)
+  SDL.drawLine renderer (P (offset + fmap round (playerPos ^/ stateScaleFactor)))
+    (P (offset + fmap round ((V2 idx1 idy1 + playerPos) ^/ stateScaleFactor)))
+  SDL.drawLine renderer (P (offset + fmap round (playerPos ^/stateScaleFactor)))
+    (P (offset + fmap round ((V2 idx2 idy2 + playerPos) ^/ stateScaleFactor)))
 
 
 processInput :: [SDL.Event] -> State -> IO (State, Bool)
