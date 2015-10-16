@@ -21,6 +21,7 @@ library
     Down.Geometry
   -- other-modules:
   -- other-extensions:
+  ghc-options: -Wall -O2
   build-depends:
     base >=4.7 && <4.9,
     waddle >= 0.1.0.5,
@@ -37,7 +38,7 @@ library
 executable down
   hs-source-dirs:      src
   main-is: Main.hs
-  ghc-options: -Wall
+  ghc-options: -Wall -O2
   build-depends:
     base >=4.7 && <4.9,
     waddle >= 0.1.0.5,

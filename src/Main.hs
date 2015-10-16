@@ -3,10 +3,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main(main) where
 
-import Game.Waddle as Waddle
+import Game.Waddle hiding (Sector)
+import qualified Game.Waddle as Waddle
 
 import Down.Geometry
 
+import Data.Word
+import Foreign
 import Data.List
 import Data.Maybe
 import qualified Data.Text as Text
@@ -27,7 +30,13 @@ import System.Exit
 import System.IO
 
 screenWidth, screenHeight :: CInt
-(screenWidth, screenHeight) = (600, 400)
+(screenWidth, screenHeight) = (800, 600)
+
+renderScale :: CInt
+renderScale = 4
+
+renderWidth, renderHeight :: CInt
+(renderWidth, renderHeight) = (screenWidth `div` renderScale, screenHeight `div` renderScale)
 
 data Input = Input {
   inputMoveForward :: Bool,
@@ -48,13 +57,23 @@ initialInput = Input {
   inputTurnRight = False
   }
 
+data RenderMode
+  = RenderNone
+  | RenderPrimitives
+  | RenderTexture
+ deriving (Eq, Ord)
+
 data State = State {
+  stateRenderMode :: RenderMode,
   stateRenderer :: SDL.Renderer,
+  stateBuffer :: SDL.Texture,
   stateAutomap :: Bool,
   stateX :: CInt,
   stateY :: CInt,
   stateLines :: Map (Id Line) Line,
   stateSides :: Map (Id Side) Side,
+  stateSectors :: Map (Id Sector) Sector,
+  playerSector :: Id Sector,
   playerPos  :: V2 Double,
   playerAngle :: Double,
   playerAccel :: V2 Double,
@@ -69,15 +88,20 @@ data State = State {
   stateInput :: Input
   }
 
-initialState :: SDL.Renderer -> Map (Id Line) Line -> Map (Id Side) Side -> V2 CInt -> State
-initialState renderer lineMap sideMap (V2 playerPosX playerPosY) =
+initialState :: SDL.Renderer -> SDL.Texture -> Map (Id Line) Line -> Map (Id Side) Side ->
+                Map (Id Sector) Sector -> V2 CInt -> State
+initialState renderer texture lineMap sideMap sectorMap (V2 playerPosX playerPosY) =
    State {
+     stateRenderMode = RenderNone,
      stateRenderer = renderer,
+     stateBuffer = texture,
      stateAutomap = False,
      stateX = 10,
      stateY = 10,
      stateLines = lineMap,
      stateSides = sideMap,
+     stateSectors = sectorMap,
+     playerSector = Id 0,
      playerPos = V2 (fromIntegral playerPosX) (fromIntegral playerPosY),
      playerAngle = pi,
      playerAccel = V2 0 0,
@@ -123,7 +147,7 @@ main = do
       window
       (-1)
       (SDL.RendererConfig
-         { SDL.rendererType = SDL.AcceleratedRenderer
+         { SDL.rendererType = SDL.AcceleratedVSyncRenderer
          , SDL.rendererTargetTexture = False
          })
 
@@ -131,12 +155,15 @@ main = do
   printf "Renderer: %s (%s)\n" (Text.unpack (SDL.rendererInfoName rInfo))
     (show $ SDL.rendererType (SDL.rendererInfoFlags rInfo))
 
-  let (lineMap, sideMap, playerPos) = convertLevel wadFile "E1M1"
+  texture <- SDL.createTexture renderer SDL.RGBA8888 SDL.TextureAccessStreaming
+             (V2 renderWidth renderHeight)
+
+  let (lineMap, sideMap, sectorMap, playerPos) = convertLevel wadFile "E1M1"
 
   putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides"
   print playerPos
-  let state = initialState renderer lineMap sideMap (maybe (V2 0 0) id playerPos)
-  gameLoop (1/60) processInput updateState renderScene state
+  let state = initialState renderer texture lineMap sideMap sectorMap (maybe (V2 0 0) id playerPos)
+  gameLoop (1/60) processInput updateState prerenderScene renderScene state
 
   putStrLn "DOWN operating system shutting down..."
   SDL.destroyRenderer renderer
@@ -144,7 +171,7 @@ main = do
   SDL.quit
   putStrLn "ENDOWN."
 
-convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, Maybe (V2 CInt))
+convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, Map (Id Sector) Sector, Maybe (V2 CInt))
 convertLevel wad lumpName =
   let Just (Level{..}) = Map.lookup (mk lumpName) (wadLevels wad)
       lineList = zipWith (\ idx LineDef{..} ->
@@ -157,23 +184,34 @@ convertLevel wad lumpName =
              [0..]
              levelLineDefs
       lmap = Map.fromList lineList
-      smap = concatMap (\ (idx, Line{..}) -> 
-               (lineRight, mkSide lmap idx True) :
-               (case lineLeft of
-                   Nothing -> []
-                   Just l -> [(l, mkSide lmap idx False)]))
-               lineList
+      sList = concatMap (\ (idx, Line{..}) ->
+                          let rSide = levelSideDefs !! fromId lineRight in
+                          (lineRight, mkSide lmap idx (Id $ fromIntegral $ sideDefSector rSide) True) :
+                          (case lineLeft of
+                              Nothing -> []
+                              Just l -> 
+                                let lSide = levelSideDefs !! fromId l in
+                                [(l, mkSide lmap idx (Id $ fromIntegral $ sideDefSector lSide) False)]))
+                lineList
+      smap = Map.fromList sList
+      secList = zipWith (\ idx Waddle.Sector{..} ->
+                          (Id idx,
+                           Sector {
+                             secFloorHeight = fromIntegral sectorFloorHeight,
+                             secCeilingHeight = fromIntegral sectorCeilingHeight,
+                             secSides = map snd $ filter (\ (_, Side{..}) -> fromId sideSector == idx) sList
+                             }))
+                [0..]
+                levelSectors
+      secmap = Map.fromList secList
       playerPos = foldr (\ Thing{..} acc ->
                           case thingType of
                             Player1StartPos ->  Just (V2 (fromIntegral thingX) (negate (fromIntegral thingY)))
                             _ -> acc) Nothing levelThings
-  in (lmap, Map.fromList smap, playerPos)
+  in (lmap, smap, secmap, playerPos)
  where
    toV2  (Vertex {..}) =
      V2 (fromIntegral vertexX) (negate (fromIntegral vertexY))
-
-vDiv :: V2 CInt -> CInt -> V2 CInt
-vDiv (V2 x y) c = V2 (x `div` c) (y `div` c)
 
 updateState ::  Monad m => State -> m State
 updateState state@State{..} = do
@@ -238,7 +276,10 @@ renderScene state@State{..} = do
   SDL.present renderer
 
 renderFirstPerson :: State -> IO ()
-renderFirstPerson State{..} = do
+renderFirstPerson State{..} | stateRenderMode == RenderNone = do
+  return ()
+
+renderFirstPerson State{..} | stateRenderMode == RenderPrimitives = do
   let renderer = stateRenderer
 
   SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
@@ -246,14 +287,11 @@ renderFirstPerson State{..} = do
 
   let angleInc = playerFov / fromIntegral screenWidth
       horizon = screenHeight `div` 2
-      threeDscale = 8
   SDL.rendererDrawColor renderer $= V4 minBound minBound minBound maxBound
 
-  forM_ [0.. (screenWidth `div` threeDscale) - 1] $ \ col -> do
-    let ang = playerAngle + (fromIntegral $ (col * threeDscale) - screenWidth `div` 2) * angleInc
+  forM_ [0.. renderWidth - 1] $ \ col -> do
+    let ang = playerAngle + (fromIntegral $ (col * renderScale) - renderWidth) * angleInc
     let V2 dx dy = angle ang
-        idx = dx * playerViewRange
-        idy = dy * playerViewRange
 
         rayP1 = playerPos
         rayP2 = playerPos + V2 dx dy ^* playerViewRange
@@ -277,15 +315,105 @@ renderFirstPerson State{..} = do
                         pdist `compare` qdist) iss
     case iss' of
       [] -> return ()
-      ((dist, Intersection p) : _) -> do
-        let disp = round (15 * playerViewRange / dist)
+      ((dist, Intersection _) : _) -> do
+        let disp = round (10 * playerViewRange / dist) * renderScale
             shade = round ((dist / playerViewRange) * 255)
         SDL.rendererDrawColor renderer $= V4 shade shade shade maxBound
         SDL.fillRect renderer $
-          Just (SDL.Rectangle (P (V2 (col * threeDscale) (horizon - disp)))
-                (V2 threeDscale (disp * 2)))
+          Just (SDL.Rectangle (P (V2 (col * renderScale) (horizon - disp)))
+                (V2 renderScale (disp * 2)))
     return()
   return ()
+
+renderFirstPerson State{..} | stateRenderMode == RenderTexture = do
+  let renderer = stateRenderer
+  SDL.copy renderer stateBuffer Nothing Nothing
+  return ()
+
+renderFirstPerson State{..} = do
+  let renderer = stateRenderer
+
+  SDL.rendererDrawColor renderer $= V4 maxBound maxBound maxBound maxBound
+  SDL.clear renderer
+
+  return ()
+
+vertLine :: Ptr Word8 -> CInt -> CInt -> CInt -> CInt -> Word32 -> IO ()
+vertLine ptr pitch x top' bot' color = do
+  let top = max 0 (min (renderHeight - 1) top')
+      bot = max 0 (min (renderHeight - 1) bot')
+      loop !row _ | row > bot = return ()
+      loop !row !aptr = do
+        let pixPtr = castPtr aptr
+        poke pixPtr color
+        loop (row + 1) (aptr `plusPtr` (fromIntegral pitch))
+  loop top (ptr `plusPtr` (fromIntegral (top * pitch + x * 4)))
+
+prerenderScene :: State -> IO State
+prerenderScene state@State{..} | stateRenderMode == RenderTexture && not stateAutomap = do
+  (dataPtr, pitch) <- SDL.lockTexture stateBuffer Nothing
+  let data8Ptr = castPtr dataPtr
+      white = 0xffffffff
+
+  let angleInc = playerFov / fromIntegral screenWidth
+      horizon = renderHeight `div` 2
+      Just currentSector = Map.lookup playerSector stateSectors
+      sectorSides = secSides currentSector
+      sectorLines = map (fromJust . (flip Map.lookup stateLines) . sideLine) sectorSides
+
+  forM_ [0 .. renderWidth - 1] $ \ col ->
+    vertLine data8Ptr pitch col 0 (renderHeight - 1) white
+
+--  print currentSector
+--  print sectorSides
+--  print sectorLines
+--  _ <- exitSuccess
+  let loop col | col > renderWidth - 1 = return ()
+      loop !col = do
+        let !ang = playerAngle + (fromIntegral $ (col * renderScale) - renderWidth) * angleInc
+        let V2 !dx !dy = angle ang
+
+            !rayP1 = playerPos
+            !rayP2 = playerPos + V2 dx dy ^* playerViewRange
+
+        let iss = foldl' (\ result Line{..} ->
+                               case lineLeft of
+                                 Nothing ->
+                                   let p3 = fmap fromIntegral lineP1
+                                       p4 = fmap fromIntegral lineP2
+                                       mbIs = segmentIntersect rayP1 rayP2 p3 p4
+                                   in
+                                    case mbIs of
+                                      Nothing -> result
+                                      Just (is@(Intersection p)) ->
+                                        (distance playerPos p * cos (ang - playerAngle), is) : result
+                                 Just _ ->
+                                   result
+                              )
+                    []
+                    sectorLines
+--                    stateLines
+            iss' = sortBy (\ (pdist, _) (qdist, _) ->
+                        pdist `compare` qdist) iss
+        case iss' of
+          [] -> return ()
+          ((dist, Intersection _) : _) -> do
+            let disp = round (10 * playerViewRange / dist)
+                shade = round ((dist / playerViewRange) * 255) :: Word32
+--            vertLine data8Ptr pitch col 0 (horizon - disp)
+--              white
+            vertLine data8Ptr pitch col (horizon - disp) (horizon + disp)
+              ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
+--            vertLine data8Ptr pitch col (horizon + disp) (renderHeight - 1)
+--              white
+        loop (col + 1)
+  loop 0
+
+  SDL.unlockTexture stateBuffer
+  return state
+
+prerenderScene state@State{..} =
+  return state
 
 renderAutomap :: State -> IO ()
 renderAutomap State{..} = do
@@ -325,7 +453,6 @@ renderAutomap State{..} = do
   SDL.drawLine renderer (P (offset + fmap round (playerPos ^/stateScaleFactor)))
     (P (offset + fmap round ((V2 idx2 idy2 + playerPos) ^/ stateScaleFactor)))
 
-
 processInput :: [SDL.Event] -> State -> IO (State, Bool)
 processInput events state = do
   return $ foldl processEvent (state, False) events
@@ -360,6 +487,11 @@ processInput events state = do
              (stateIn, True)
            SDL.KeycodeTab ->
              (stateIn{stateAutomap = not (stateAutomap stateIn)}, quit)
+           SDL.KeycodeR ->
+             (stateIn{stateRenderMode = case stateRenderMode stateIn of
+                         RenderNone -> RenderPrimitives
+                         RenderPrimitives -> RenderTexture
+                         _ -> RenderNone}, quit)
            SDL.KeycodeA ->
              (stateIn{stateInput = (stateInput stateIn){inputStrafeLeft = False}}, quit)
            SDL.KeycodeD ->
@@ -385,8 +517,9 @@ processInput events state = do
 -- loop in Robert Nystrom, "Game Programming Patterns", see
 -- http://gameprogrammingpatterns.com/game-loop.html for details.
 --
-gameLoop :: Double -> ([SDL.Event] -> state -> IO (state, Bool)) -> (state -> IO state) -> (state -> IO ()) -> state -> IO ()
-gameLoop ms_per_update inputFun updateFun renderFun startState = do
+gameLoop :: Double -> ([SDL.Event] -> state -> IO (state, Bool)) -> (state -> IO state) ->
+            (state -> IO state) -> (state -> IO ()) -> state -> IO ()
+gameLoop ms_per_update inputFun updateFun prerenderFun renderFun startState = do
   now <- getCurrentTime
   loop now (0 :: Int) (0 :: Int) now (0.0 :: Double) (0 :: Int) startState
  where
@@ -404,7 +537,9 @@ gameLoop ms_per_update inputFun updateFun renderFun startState = do
            | theLag >= ms_per_update = do
              state' <- updateFun state
              updateLoop (theLag - ms_per_update) (gameTicks + 1) state'
-           | otherwise = return (theLag, gameTicks, state)
+           | otherwise = do
+             state' <- prerenderFun state
+             return (theLag, gameTicks, state')
 
      (lagOut, gameTicksOut, stateOut) <- updateLoop lag' gameTicksIn stateIn
 
@@ -412,7 +547,7 @@ gameLoop ms_per_update inputFun updateFun renderFun startState = do
 
      let diff = now `diffUTCTime` lastReportTime
      unless quit $ do
-          if diff < 5
+          if diff < 3
             then
                loop lastReportTime (lastReportFrames + 1) (lastReportTicks + (gameTicksOut - gameTicksIn))
                   previousTime' lagOut gameTicksOut stateOut
@@ -421,15 +556,23 @@ gameLoop ms_per_update inputFun updateFun renderFun startState = do
               putStrLn $ show (fromIntegral lastReportTicks / diff) ++ " TPS"
               loop now 0 0 previousTime' lagOut gameTicksOut stateOut
 
-data Id a = Id Int
+data Id a = Id {fromId :: Int}
   deriving (Show, Eq, Ord)
+
+data Sector = Sector {
+  secFloorHeight :: CInt,
+  secCeilingHeight :: CInt,
+  secSides :: [Side]
+  }
+  deriving (Show)
 
 data Side = Side {
   sideP1 :: V2 CInt,
   sideP2 :: V2 CInt,
   sideDelta  :: V2 CInt,
 --  sideNormal :: V2 CInt,
-  sideLine   :: Id Line
+  sideLine   :: Id Line,
+  sideSector :: Id Sector
   }
   deriving (Show)
 
@@ -456,8 +599,8 @@ mkLine p1 p2 right mbLeft =
      lineLeft = mbLeft
      }
 
-mkSide :: Map (Id Line) Line -> Id Line -> Bool -> Side
-mkSide lineMap lineId onRight =
+mkSide :: Map (Id Line) Line -> Id Line -> Id Sector -> Bool -> Side
+mkSide lineMap lineId sectorId onRight =
   let Just (Line{..}) = Map.lookup lineId lineMap
       p1 = if onRight then lineP1 else lineP2
       p2 = if onRight then lineP2 else lineP1
@@ -468,5 +611,6 @@ mkSide lineMap lineId onRight =
      sideP2 = p2,
      sideDelta = delta,
 --     sideNormal = vNormalize (perp delta),
-     sideLine = lineId
+     sideLine = lineId,
+     sideSector = sectorId
      }
