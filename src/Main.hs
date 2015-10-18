@@ -82,6 +82,8 @@ data State = State {
   playerMaxAccel :: Double,
   playerTurnAngle :: Double,
   playerMoveAccel :: Double,
+  playerHeight :: Double,
+  playerEyeLevel :: Double,
   playerFov :: Double,
   playerViewRange :: Double,
   stateScaleFactor :: Double,
@@ -89,10 +91,10 @@ data State = State {
   }
 
 initialState :: SDL.Renderer -> SDL.Texture -> Map (Id Line) Line -> Map (Id Side) Side ->
-                Map (Id Sector) Sector -> V2 CInt -> State
-initialState renderer texture lineMap sideMap sectorMap (V2 playerPosX playerPosY) =
+                Map (Id Sector) Sector -> V2 CInt -> Double -> Id Sector -> State
+initialState renderer texture lineMap sideMap sectorMap (V2 playerPosX playerPosY) playerAngle playerSector =
    State {
-     stateRenderMode = RenderNone,
+     stateRenderMode = RenderTexture,
      stateRenderer = renderer,
      stateBuffer = texture,
      stateAutomap = False,
@@ -101,16 +103,18 @@ initialState renderer texture lineMap sideMap sectorMap (V2 playerPosX playerPos
      stateLines = lineMap,
      stateSides = sideMap,
      stateSectors = sectorMap,
-     playerSector = Id 0,
+     playerSector = playerSector,
      playerPos = V2 (fromIntegral playerPosX) (fromIntegral playerPosY),
-     playerAngle = pi,
+     playerAngle = playerAngle,
      playerAccel = V2 0 0,
      playerVelocity = V2 0 0,
      playerMaxSpeed = 20,
-     playerMaxAccel = 2,
-     playerTurnAngle = 0.05,
-     playerMoveAccel = 1,
-     playerFov = 60 / 180 * pi,
+     playerMaxAccel = 1.5,
+     playerTurnAngle = 0.015,
+     playerMoveAccel = 0.5,
+     playerHeight = maybe 0 secFloorHeight $ Map.lookup playerSector sectorMap,
+     playerEyeLevel = 46,
+     playerFov = 80 / 180 * pi,
      playerViewRange = 2000,
      stateScaleFactor = 7,
      stateInput = initialInput
@@ -147,7 +151,7 @@ main = do
       window
       (-1)
       (SDL.RendererConfig
-         { SDL.rendererType = SDL.AcceleratedVSyncRenderer
+         { SDL.rendererType = SDL.AcceleratedRenderer
          , SDL.rendererTargetTexture = False
          })
 
@@ -158,11 +162,13 @@ main = do
   texture <- SDL.createTexture renderer SDL.RGBA8888 SDL.TextureAccessStreaming
              (V2 renderWidth renderHeight)
 
-  let (lineMap, sideMap, sectorMap, playerPos) = convertLevel wadFile "E1M1"
+  let (lineMap, sideMap, sectorMap, playerPos, playerAngle, playerSector) = convertLevel wadFile "E1M1"
 
   putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides"
-  print playerPos
-  let state = initialState renderer texture lineMap sideMap sectorMap (maybe (V2 0 0) id playerPos)
+--  print playerPos
+--  print (playerSector, maybe Nothing (flip Map.lookup sectorMap) playerSector)
+  -- forM_ (Map.toList sectorMap) $ \ (i, Sector{..}) -> print (fromId i, secBbox)
+  let state = initialState renderer texture lineMap sideMap sectorMap (maybe (V2 0 0) id playerPos) playerAngle (maybe (Id 0) id playerSector)
   gameLoop (1/60) processInput updateState prerenderScene renderScene state
 
   putStrLn "DOWN operating system shutting down..."
@@ -171,7 +177,7 @@ main = do
   SDL.quit
   putStrLn "ENDOWN."
 
-convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, Map (Id Sector) Sector, Maybe (V2 CInt))
+convertLevel :: Wad -> ByteString -> (Map (Id Line) Line, Map (Id Side) Side, Map (Id Sector) Sector, Maybe (V2 CInt), Double, Maybe (Id Sector))
 convertLevel wad lumpName =
   let Just (Level{..}) = Map.lookup (mk lumpName) (wadLevels wad)
       lineList = zipWith (\ idx LineDef{..} ->
@@ -195,23 +201,31 @@ convertLevel wad lumpName =
                 lineList
       smap = Map.fromList sList
       secList = zipWith (\ idx Waddle.Sector{..} ->
+                          let sides = filter (\ (_, Side{..}) -> fromId sideSector == idx) sList
+                          in
                           (Id idx,
                            Sector {
                              secFloorHeight = fromIntegral sectorFloorHeight,
                              secCeilingHeight = fromIntegral sectorCeilingHeight,
-                             secSides = map snd $ filter (\ (_, Side{..}) -> fromId sideSector == idx) sList
+                             secSides = sides,
+                             secBbox = mkSectorBbox (map snd sides) emptyBbox
                              }))
                 [0..]
                 levelSectors
       secmap = Map.fromList secList
-      playerPos = foldr (\ Thing{..} acc ->
-                          case thingType of
-                            Player1StartPos ->  Just (V2 (fromIntegral thingX) (negate (fromIntegral thingY)))
-                            _ -> acc) Nothing levelThings
-  in (lmap, smap, secmap, playerPos)
+      (playerPos, playerAngle) = foldr (\ Thing{..} acc ->
+                                         case thingType of
+                                           Player1StartPos ->
+                                             (Just (V2 (fromIntegral thingX) (negate (fromIntegral thingY))),
+                                              (fromIntegral thingAngle / 180 * pi + pi))
+                                           _ -> acc) (Nothing, 0) levelThings
+  in (lmap, smap, secmap, playerPos, playerAngle, maybe Nothing (findSector secmap . fmap fromIntegral) playerPos)
  where
    toV2  (Vertex {..}) =
      V2 (fromIntegral vertexX) (negate (fromIntegral vertexY))
+   mkSectorBbox [] acc = acc
+   mkSectorBbox (Side{..} : rest) acc =
+     mkSectorBbox rest (bboxExtend (bboxExtend acc sideP1) sideP2)
 
 updateState ::  Monad m => State -> m State
 updateState state@State{..} = do
@@ -220,6 +234,7 @@ updateState state@State{..} = do
                inputMoveBackward (stateInput) ||
                inputStrafeLeft (stateInput) ||
                inputStrafeRight (stateInput)
+      newSec = maybe playerSector id (findSector stateSectors $ playerPos + playerVelocity)
   return $ state{
     stateX = stateX + 1,
     stateY = stateY + 1,
@@ -231,6 +246,8 @@ updateState state@State{..} = do
                     else
                       playerAngle,
     playerPos = playerPos + playerVelocity,
+    playerSector = newSec,
+    playerHeight = maybe playerHeight secFloorHeight (Map.lookup newSec stateSectors),
     playerVelocity = if moving
                      then
                        let newVelocity = playerVelocity + playerAccel
@@ -299,8 +316,8 @@ renderFirstPerson State{..} | stateRenderMode == RenderPrimitives = do
     let iss = catMaybes $ map (\ Line{..} ->
                                case lineLeft of
                                  Nothing ->
-                                   let p3 = fmap fromIntegral lineP1
-                                       p4 = fmap fromIntegral lineP2
+                                   let p3 = lineP1
+                                       p4 = lineP2
                                        mbIs = segmentIntersect rayP1 rayP2 p3 p4
                                    in
                                     case mbIs of
@@ -316,7 +333,7 @@ renderFirstPerson State{..} | stateRenderMode == RenderPrimitives = do
     case iss' of
       [] -> return ()
       ((dist, Intersection _) : _) -> do
-        let disp = round (10 * playerViewRange / dist) * renderScale
+        let disp = round (8 * playerViewRange / dist) * renderScale
             shade = round ((dist / playerViewRange) * 255)
         SDL.rendererDrawColor renderer $= V4 shade shade shade maxBound
         SDL.fillRect renderer $
@@ -355,65 +372,88 @@ prerenderScene state@State{..} | stateRenderMode == RenderTexture && not stateAu
   let data8Ptr = castPtr dataPtr
       white = 0xffffffff
 
-  let angleInc = playerFov / fromIntegral screenWidth
-      horizon = renderHeight `div` 2
+  let angleInc = playerFov / fromIntegral renderWidth
       Just currentSector = Map.lookup playerSector stateSectors
-      sectorSides = secSides currentSector
-      sectorLines = map (fromJust . (flip Map.lookup stateLines) . sideLine) sectorSides
 
   forM_ [0 .. renderWidth - 1] $ \ col ->
     vertLine data8Ptr pitch col 0 (renderHeight - 1) white
 
---  print currentSector
---  print sectorSides
---  print sectorLines
---  _ <- exitSuccess
-  let loop col | col > renderWidth - 1 = return ()
-      loop !col = do
-        let !ang = playerAngle + (fromIntegral $ (col * renderScale) - renderWidth) * angleInc
-        let V2 !dx !dy = angle ang
+  let loop col _ | col > renderWidth - 1 = return ()
+      loop !col !ang = do
+        let currAng = ang + playerAngle
+            V2 !dx !dy = angle currAng
+            !rayEnd = playerPos + V2 dx dy ^* playerViewRange
 
-            !rayP1 = playerPos
-            !rayP2 = playerPos + V2 dx dy ^* playerViewRange
-
-        let iss = foldl' (\ result Line{..} ->
-                               case lineLeft of
-                                 Nothing ->
-                                   let p3 = fmap fromIntegral lineP1
-                                       p4 = fmap fromIntegral lineP2
-                                       mbIs = segmentIntersect rayP1 rayP2 p3 p4
-                                   in
-                                    case mbIs of
-                                      Nothing -> result
-                                      Just (is@(Intersection p)) ->
-                                        (distance playerPos p * cos (ang - playerAngle), is) : result
-                                 Just _ ->
-                                   result
-                              )
-                    []
-                    sectorLines
---                    stateLines
-            iss' = sortBy (\ (pdist, _) (qdist, _) ->
-                        pdist `compare` qdist) iss
-        case iss' of
-          [] -> return ()
-          ((dist, Intersection _) : _) -> do
-            let disp = round (10 * playerViewRange / dist)
-                shade = round ((dist / playerViewRange) * 255) :: Word32
---            vertLine data8Ptr pitch col 0 (horizon - disp)
---              white
-            vertLine data8Ptr pitch col (horizon - disp) (horizon + disp)
-              ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
---            vertLine data8Ptr pitch col (horizon + disp) (renderHeight - 1)
---              white
-        loop (col + 1)
-  loop 0
+        renderColumn state data8Ptr pitch currentSector playerPos playerPos rayEnd currAng dx dy col 0 (fromIntegral $ renderHeight - 1) 0
+        loop (col + 1) (ang + angleInc)
+  loop 0 (negate (playerFov/2))
 
   SDL.unlockTexture stateBuffer
   return state
 
 prerenderScene state@State{..} =
   return state
+
+renderColumn :: State -> Ptr Word8 -> CInt -> Sector -> V2 Double -> V2 Double -> V2 Double -> Double -> Double -> Double -> CInt -> Double -> Double -> Int -> IO ()
+renderColumn state@State{..} data8Ptr pitch currentSector startPos rayStart rayEnd ang dx dy col windowTop windowBot depth | depth < 100 = do
+  let horizon = (fromIntegral renderHeight :: Double) / 2
+
+  let handleSide result (sideId, side@Side{..}) =
+        if dot sideNormal (V2 dx dy) < 0
+        then
+          case segmentIntersect rayStart rayEnd sideP1 sideP2 of
+            Nothing -> result
+            Just (is@(Intersection p)) ->
+              (distance startPos p * cos (ang - playerAngle), is, sideId, side) : result
+        else
+          result
+  let intersectons = foldl' handleSide [] (secSides currentSector)
+      sortedIntersections = sortBy (\ (pdist, _, _, _) (qdist, _, _, _) ->
+                                     pdist `compare` qdist)
+                            intersectons
+  case sortedIntersections of
+    [] -> return ()
+    ((dist, Intersection intersection, sideId, side) : _) -> do
+      let dispFactor =  0.1 * playerViewRange / dist
+          eyeLevel = playerHeight + playerEyeLevel
+          wallTop = horizon + (dispFactor * (eyeLevel - secCeilingHeight currentSector)) 
+          wallBot = horizon + (dispFactor * (eyeLevel - secFloorHeight currentSector))
+          shade = round (235 - (dist / playerViewRange) * 235) .&. 255 :: Word32
+          colTop = max wallTop windowTop
+          colBot = min wallBot windowBot
+      case otherSectorOfSide state sideId of
+        Nothing ->
+          vertLine data8Ptr pitch col (round colTop) (round colBot)
+            ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
+        Just otherSector -> do
+          let otherWallTop = horizon + (dispFactor * (eyeLevel - secCeilingHeight otherSector))
+              otherWallBot = horizon + (dispFactor * (eyeLevel - secFloorHeight otherSector))
+              midWallTop = max wallTop otherWallTop
+              midWallBot = min wallBot otherWallBot
+              midColTop = max midWallTop windowTop
+              midColBot = min midWallBot windowBot
+          if otherWallTop < wallTop
+            then
+            vertLine data8Ptr pitch col (round colTop) (round midColTop)
+              ((255 `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
+--              ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
+            else
+            return()
+          if otherWallBot > wallBot
+            then
+            vertLine data8Ptr pitch col (round midColBot) (round colBot)
+              ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (255 `shiftL` 8) .|. 255)
+--              ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
+            else
+            return()
+          if midColTop < midColBot
+            then
+            renderColumn state data8Ptr pitch otherSector startPos intersection rayEnd ang dx dy col midColTop midColBot (depth + 1)
+            else
+            return ()
+renderColumn _ _ _ _ _ _ _ _ _ _ _ _ _ depth = do
+  putStrLn $ "depth overflow: " ++ show depth
+          
 
 renderAutomap :: State -> IO ()
 renderAutomap State{..} = do
@@ -437,8 +477,10 @@ renderAutomap State{..} = do
   SDL.rendererDrawColor renderer $= V4 minBound minBound minBound maxBound
 
   forM_ (Map.elems stateLines) $ \ Line{..} -> do
-    SDL.drawLine renderer (P (fmap round (fmap fromIntegral lineP1 ^/ stateScaleFactor) + offset))
-      (P (fmap round (fmap fromIntegral lineP2 ^/ stateScaleFactor) + offset))
+    SDL.drawLine renderer (P (fmap round (lineP1 ^/ stateScaleFactor) + offset))
+      (P (fmap round (lineP2 ^/ stateScaleFactor) + offset))
+    SDL.drawLine renderer (P (fmap round ((lineP1 + (lineDelta ^/ 2)) ^/ stateScaleFactor) + offset))
+      (P (fmap round ((lineP1 + (lineDelta ^/ 2) + lineNormal ^* 10) ^/ stateScaleFactor) + offset))
 
   -- Render player.
   SDL.fillRect renderer (Just (SDL.Rectangle (P (V2 (-5) (-5) + offset + (fmap round (playerPos ^/ stateScaleFactor)))) (V2 10 10)))
@@ -492,6 +534,10 @@ processInput events state = do
                          RenderNone -> RenderPrimitives
                          RenderPrimitives -> RenderTexture
                          _ -> RenderNone}, quit)
+           SDL.KeycodePlus ->
+             (stateIn{stateScaleFactor = min (stateScaleFactor stateIn * 1.2) 10}, quit)
+           SDL.KeycodeMinus ->
+             (stateIn{stateScaleFactor = max (stateScaleFactor stateIn / 1.2) 0.1}, quit)
            SDL.KeycodeA ->
              (stateIn{stateInput = (stateInput stateIn){inputStrafeLeft = False}}, quit)
            SDL.KeycodeD ->
@@ -560,33 +606,34 @@ data Id a = Id {fromId :: Int}
   deriving (Show, Eq, Ord)
 
 data Sector = Sector {
-  secFloorHeight :: CInt,
-  secCeilingHeight :: CInt,
-  secSides :: [Side]
+  secFloorHeight :: Double,
+  secCeilingHeight :: Double,
+  secSides :: [(Id Side, Side)],
+  secBbox :: Bbox
   }
   deriving (Show)
 
 data Side = Side {
-  sideP1 :: V2 CInt,
-  sideP2 :: V2 CInt,
-  sideDelta  :: V2 CInt,
---  sideNormal :: V2 CInt,
+  sideP1 :: V2 Double,
+  sideP2 :: V2 Double,
+  sideDelta  :: V2 Double,
+  sideNormal :: V2 Double,
   sideLine   :: Id Line,
   sideSector :: Id Sector
   }
   deriving (Show)
 
 data Line = Line {
-  lineP1 :: V2 CInt,
-  lineP2 :: V2 CInt,
-  lineDelta  :: V2 CInt,
---  lineNormal :: V2 CInt,
+  lineP1 :: V2 Double,
+  lineP2 :: V2 Double,
+  lineDelta  :: V2 Double,
+  lineNormal :: V2 Double,
   lineRight  :: Id Side,
   lineLeft   :: Maybe (Id Side)
   }
   deriving (Show)
 
-mkLine :: V2 CInt -> V2 CInt -> Id Side -> Maybe (Id Side) -> Line
+mkLine :: V2 Double -> V2 Double -> Id Side -> Maybe (Id Side) -> Line
 mkLine p1 p2 right mbLeft =
   let delta = p2 - p1
   in
@@ -594,7 +641,7 @@ mkLine p1 p2 right mbLeft =
      lineP1 = p1,
      lineP2 = p2,
      lineDelta = delta,
---     lineNormal = vNormalize (perp delta),
+     lineNormal = signorm (perp delta),
      lineRight = right,
      lineLeft = mbLeft
      }
@@ -610,7 +657,99 @@ mkSide lineMap lineId sectorId onRight =
      sideP1 = p1,
      sideP2 = p2,
      sideDelta = delta,
---     sideNormal = vNormalize (perp delta),
+     sideNormal = signorm (perp delta),
      sideLine = lineId,
      sideSector = sectorId
      }
+
+data Bbox = Bbox {
+  bboxLeft :: Double,
+  bboxTop  :: Double,
+  bboxRight :: Double,
+  bboxBottom :: Double
+ }
+ deriving (Show)
+
+-- | An empty bounding box.
+--
+emptyBbox :: Bbox
+emptyBbox = Bbox {
+  bboxLeft = 1e12,
+  bboxTop = 1e12,
+  bboxRight = -1e12,
+  bboxBottom = -1e12
+  }
+
+-- | Return 'True' if the given bounding box is empty, and 'False'
+-- otherwise.
+--
+bboxIsEmpty :: Bbox -> Bool
+bboxIsEmpty (Bbox left top right bottom) =
+  left >= right || top >= bottom
+
+-- | Extend the given bounding box so that the result contains both
+-- the original bounding box and the given point.
+--
+bboxExtend :: Bbox -> V2 Double -> Bbox
+bboxExtend (Bbox left top right bottom) (V2 x y) =
+  Bbox {
+    bboxLeft = min left x,
+    bboxTop = min top y,
+    bboxRight = max right x,
+    bboxBottom = max bottom y
+  }
+
+-- | Return 'True' if the given bounding box contains the given point.
+--
+bboxContains :: Bbox -> V2 Double -> Bool
+bboxContains (Bbox left top right bottom) (V2 x y) =
+  x >= left && x <= right && y >= top && y <= bottom
+
+-- | Return the area enclosed in the given bounding box.  Returns 0
+-- for any bounding box @bbox@ when 'bboxIsEmpty' @bbox@ = 'True'.
+--
+bboxArea :: Bbox -> Double
+bboxArea bbox@(Bbox left top right bottom) =
+  if bboxIsEmpty bbox
+  then 0
+  else (right - left) * (bottom - top)
+
+-- | Find the smallest sector that contains the given point (if there
+-- is any).
+--
+findSector :: Map (Id Sector) Sector -> V2 Double -> Maybe (Id Sector)
+findSector secMap p =
+  let (_, res) = Map.foldrWithKey' (\ k Sector{..} acc@(area, _) ->
+                                     if bboxContains secBbox p
+                                     then
+                                       let a = bboxArea secBbox
+                                       in if a > area
+                                          then (a, Just k)
+                                          else acc
+                                     else acc) (0, Nothing) secMap
+  in res
+
+               
+-- | Return a list of all sides of a sector (in no particular order).
+--
+sidesOfSector :: State -> Id Sector -> [(Id Side, Side)]
+sidesOfSector State{..} secId =
+  maybe (error "sidesOfVector: impossible") secSides $ Map.lookup secId stateSectors
+
+-- | Given a side ID, return the sector on the other side (if there is
+-- any).
+--
+otherSectorOfSide :: State -> Id Side -> Maybe Sector
+otherSectorOfSide State{..} sideId =
+  let thisSide = maybe (error "otherSector: impossible (1)") id $ Map.lookup sideId stateSides
+      Line{..} = maybe (error "otherSector: impossible (2)") id $ Map.lookup (sideLine thisSide) stateLines
+      otherSide = if lineRight == sideId
+                  then
+                    case lineLeft of
+                      Nothing -> Nothing
+                      Just l -> Map.lookup l stateSides
+                  else Map.lookup lineRight stateSides
+  in case otherSide of
+    Just otherSide' -> Map.lookup (sideSector otherSide') stateSectors
+    _ -> Nothing
+
