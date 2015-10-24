@@ -115,7 +115,7 @@ initialState renderer texture lineMap sideMap sectorMap (V2 playerPosX playerPos
      playerHeight = maybe 0 secFloorHeight $ Map.lookup playerSector sectorMap,
      playerEyeLevel = 46,
      playerFov = 80 / 180 * pi,
-     playerViewRange = 2000,
+     playerViewRange = 4000,
      stateScaleFactor = 7,
      stateInput = initialInput
      }
@@ -165,8 +165,8 @@ main = do
   let (lineMap, sideMap, sectorMap, playerPos, playerAngle, playerSector) = convertLevel wadFile "E1M1"
 
   putStrLn $ show (Map.size lineMap) ++ " lines, " ++ show (Map.size sideMap) ++ " sides"
---  print playerPos
---  print (playerSector, maybe Nothing (flip Map.lookup sectorMap) playerSector)
+  print playerPos
+  print (playerSector, maybe Nothing (flip Map.lookup sectorMap) playerSector)
   -- forM_ (Map.toList sectorMap) $ \ (i, Sector{..}) -> print (fromId i, secBbox)
   let state = initialState renderer texture lineMap sideMap sectorMap (maybe (V2 0 0) id playerPos) playerAngle (maybe (Id 0) id playerSector)
   gameLoop (1/60) processInput updateState prerenderScene renderScene state
@@ -234,7 +234,28 @@ updateState state@State{..} = do
                inputMoveBackward (stateInput) ||
                inputStrafeLeft (stateInput) ||
                inputStrafeRight (stateInput)
-      newSec = maybe playerSector id (findSector stateSectors $ playerPos + playerVelocity)
+      rayStart = playerPos
+      rayEnd = playerPos + playerVelocity
+      handleSide result (sideId, side@Side{..}) =
+        if dot sideNormal playerVelocity < 0
+        then
+          case segmentIntersect rayStart rayEnd sideP1 sideP2 of
+            Nothing -> result
+            Just (is@(Intersection p)) ->
+              (is, sideId, side) : result
+        else
+          result
+      Just currentSector = Map.lookup playerSector stateSectors
+      intersections = foldl' handleSide [] (secSides currentSector)
+      newSec =
+        case intersections of
+          [] -> playerSector
+          ((Intersection intersection, sideId, side) : _) ->
+            case otherSectorOfSide state sideId of
+              Nothing ->
+                playerSector
+              Just (otherSectorId, _) ->
+                otherSectorId
   return $ state{
     stateX = stateX + 1,
     stateY = stateY + 1,
@@ -414,32 +435,44 @@ renderColumn state@State{..} data8Ptr pitch currentSector startPos rayStart rayE
   case sortedIntersections of
     [] -> return ()
     ((dist, Intersection intersection, sideId, side) : _) -> do
-      let dispFactor =  0.1 * playerViewRange / dist
+      let dispFactor =  0.05 * playerViewRange / dist
           eyeLevel = playerHeight + playerEyeLevel
           wallTop = horizon + (dispFactor * (eyeLevel - secCeilingHeight currentSector)) 
           wallBot = horizon + (dispFactor * (eyeLevel - secFloorHeight currentSector))
           shade = round (235 - (dist / playerViewRange) * 235) .&. 255 :: Word32
-          colTop = max wallTop windowTop
-          colBot = min wallBot windowBot
+          colTop = min (max wallTop windowTop) windowBot
+          colBot = max (min wallBot windowBot) windowTop
+      if windowTop < colTop
+        then
+          vertLine data8Ptr pitch col (round windowTop) (round colTop)
+            0xd0d0d0ff
+        else
+        return ()
+      if colBot < windowBot
+        then
+          vertLine data8Ptr pitch col (round colBot) (round windowBot)
+            0xa0a0a0ff
+        else
+        return ()
       case otherSectorOfSide state sideId of
         Nothing ->
           vertLine data8Ptr pitch col (round colTop) (round colBot)
             ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
-        Just otherSector -> do
+        Just (_, otherSector) -> do
           let otherWallTop = horizon + (dispFactor * (eyeLevel - secCeilingHeight otherSector))
               otherWallBot = horizon + (dispFactor * (eyeLevel - secFloorHeight otherSector))
               midWallTop = max wallTop otherWallTop
               midWallBot = min wallBot otherWallBot
-              midColTop = max midWallTop windowTop
-              midColBot = min midWallBot windowBot
-          if otherWallTop < wallTop
+              midColTop = min (max midWallTop windowTop) windowBot
+              midColBot = max (min midWallBot windowBot) windowTop
+          if secCeilingHeight otherSector < secCeilingHeight currentSector
             then
             vertLine data8Ptr pitch col (round colTop) (round midColTop)
               ((255 `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
 --              ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (shade `shiftL` 8) .|. 255)
             else
             return()
-          if otherWallBot > wallBot
+          if secFloorHeight otherSector > secFloorHeight currentSector
             then
             vertLine data8Ptr pitch col (round midColBot) (round colBot)
               ((shade `shiftL` 24) .|. (shade `shiftL` 16) .|. (255 `shiftL` 8) .|. 255)
@@ -723,10 +756,10 @@ findSector secMap p =
                                      if bboxContains secBbox p
                                      then
                                        let a = bboxArea secBbox
-                                       in if a > area
+                                       in if a < area
                                           then (a, Just k)
                                           else acc
-                                     else acc) (0, Nothing) secMap
+                                     else acc) (1e20, Nothing) secMap
   in res
 
                
@@ -739,7 +772,7 @@ sidesOfSector State{..} secId =
 -- | Given a side ID, return the sector on the other side (if there is
 -- any).
 --
-otherSectorOfSide :: State -> Id Side -> Maybe Sector
+otherSectorOfSide :: State -> Id Side -> Maybe (Id Sector, Sector)
 otherSectorOfSide State{..} sideId =
   let thisSide = maybe (error "otherSector: impossible (1)") id $ Map.lookup sideId stateSides
       Line{..} = maybe (error "otherSector: impossible (2)") id $ Map.lookup (sideLine thisSide) stateLines
@@ -750,6 +783,9 @@ otherSectorOfSide State{..} sideId =
                       Just l -> Map.lookup l stateSides
                   else Map.lookup lineRight stateSides
   in case otherSide of
-    Just otherSide' -> Map.lookup (sideSector otherSide') stateSectors
+    Just otherSide' ->
+      case Map.lookup (sideSector otherSide') stateSectors of
+        Just sec -> Just (sideSector otherSide', sec)
+        Nothing -> Nothing
     _ -> Nothing
 
